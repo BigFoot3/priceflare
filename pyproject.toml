@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "priceflare"
+version = "0.1.0"
+description = "Exchange-agnostic real-time price crash and pump detector over WebSocket"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+keywords = ["crypto", "trading", "websocket", "price", "crash", "pump", "detector", "alert"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Office/Business :: Financial",
+]
+
+dependencies = [
+    "websocket-client>=1.6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.0",
+    "pytest-cov>=5.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/BigFoot3/priceflare"
+Repository = "https://github.com/BigFoot3/priceflare"
+Issues = "https://github.com/BigFoot3/priceflare/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["priceflare*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["priceflare"]
+omit = ["tests/*", "venv/*"]
