@@ -48,9 +48,16 @@ class TestSentinelInit:
         s = make_sentinel()
         assert s is not None
 
-    def test_empty_ws_url_raises(self):
+    def test_empty_ws_url_does_not_raise_on_init(self):
+        """ws_url="" is valid for offline/backtesting use via feed()."""
+        s = make_sentinel(ws_url="")
+        assert s is not None
+
+    def test_empty_ws_url_raises_on_start(self):
+        """start() must raise SentinelError when ws_url is empty."""
+        s = make_sentinel(ws_url="")
         with pytest.raises(SentinelError, match="ws_url"):
-            make_sentinel(ws_url="")
+            s.start()
 
     def test_non_callable_parser_raises(self):
         with pytest.raises(SentinelError, match="price_parser"):
@@ -71,6 +78,14 @@ class TestSentinelInit:
     def test_negative_cooldown_raises(self):
         with pytest.raises(SentinelError, match="cooldown_seconds"):
             make_sentinel(cooldown_seconds=-1)
+
+    def test_zero_max_reconnects_raises(self):
+        with pytest.raises(SentinelError, match="max_reconnects"):
+            make_sentinel(max_reconnects=0)
+
+    def test_negative_max_reconnects_raises(self):
+        with pytest.raises(SentinelError, match="max_reconnects"):
+            make_sentinel(max_reconnects=-5)
 
     def test_custom_parser_accepted(self):
         s = make_sentinel(price_parser=lambda raw: 1.0)
@@ -268,18 +283,33 @@ class TestCallbacks:
         cb.assert_called_once()
         assert cb.call_args[0][0]["type"] == "PUMP"
 
-    def test_on_crash_called_only_on_crash(self):
+    def test_on_crash_called_with_correct_price(self):
         crash_cb = MagicMock()
         s = make_sentinel(crash_threshold=3.0, cooldown_seconds=0, on_crash=crash_cb)
-        s._on_message(None, json.dumps({"p": "960.0"}))  # simulate via _on_message
-        # prices < 10 → no alert yet
-        crash_cb.assert_not_called()
+        for p in [1000.0] * 10:
+            s.feed(p)
+        s.feed(960.0)
+        crash_cb.assert_called_once_with(960.0)
 
     def test_on_crash_not_called_on_pump(self):
         crash_cb = MagicMock()
         s = make_sentinel(pump_threshold=3.0, cooldown_seconds=0, on_crash=crash_cb)
         _feed_prices(s, [1000.0] * 10 + [1040.0])
         crash_cb.assert_not_called()
+
+    def test_on_pump_called_with_correct_price(self):
+        pump_cb = MagicMock()
+        s = make_sentinel(pump_threshold=3.0, cooldown_seconds=0, on_pump=pump_cb)
+        for p in [1000.0] * 10:
+            s.feed(p)
+        s.feed(1040.0)
+        pump_cb.assert_called_once_with(1040.0)
+
+    def test_on_pump_not_called_on_crash(self):
+        pump_cb = MagicMock()
+        s = make_sentinel(crash_threshold=3.0, cooldown_seconds=0, on_pump=pump_cb)
+        _feed_prices(s, [1000.0] * 10 + [960.0])
+        pump_cb.assert_not_called()
 
     def test_on_alert_not_called_without_alert(self):
         cb = MagicMock()
@@ -298,6 +328,24 @@ class TestCallbacks:
             s._on_message(None, json.dumps({"p": "1000"}))
         s._on_message(None, json.dumps({"p": "960"}))  # triggers callback
 
+    def test_on_crash_callback_exception_does_not_propagate(self):
+        def bad_crash(price):
+            raise RuntimeError("crash boom")
+
+        s = make_sentinel(crash_threshold=3.0, cooldown_seconds=0, on_crash=bad_crash)
+        for _ in range(10):
+            s.feed(1000.0)
+        s.feed(960.0)  # should not raise
+
+    def test_on_pump_callback_exception_does_not_propagate(self):
+        def bad_pump(price):
+            raise RuntimeError("pump boom")
+
+        s = make_sentinel(pump_threshold=3.0, cooldown_seconds=0, on_pump=bad_pump)
+        for _ in range(10):
+            s.feed(1000.0)
+        s.feed(1040.0)  # should not raise
+
 
 # ---------------------------------------------------------------------------
 # feed() — public injection method
@@ -312,6 +360,15 @@ class TestFeed:
 
     def test_feed_returns_alert_on_crash(self):
         s = make_sentinel(crash_threshold=3.0, cooldown_seconds=0)
+        for _ in range(10):
+            s.feed(1000.0)
+        result = s.feed(960.0)
+        assert result is not None
+        assert result["type"] == "CRASH"
+
+    def test_feed_works_with_empty_ws_url(self):
+        """Offline/backtesting mode: feed() must work even without a ws_url."""
+        s = make_sentinel(ws_url="", cooldown_seconds=0)
         for _ in range(10):
             s.feed(1000.0)
         result = s.feed(960.0)
@@ -347,6 +404,25 @@ class TestStatus:
         s.feed(960.0)
         st = s.status()
         assert st["last_alert_at"] is not None
+
+
+# ---------------------------------------------------------------------------
+# subscribe_message
+# ---------------------------------------------------------------------------
+
+class TestSubscribeMessage:
+    def test_subscribe_message_sent_on_open(self):
+        msg = '{"method": "subscribe", "params": {"channel": "ticker"}}'
+        s = make_sentinel(subscribe_message=msg)
+        mock_ws = MagicMock()
+        s._on_open(mock_ws)
+        mock_ws.send.assert_called_once_with(msg)
+
+    def test_no_subscribe_message_no_send(self):
+        s = make_sentinel()
+        mock_ws = MagicMock()
+        s._on_open(mock_ws)
+        mock_ws.send.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

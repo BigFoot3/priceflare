@@ -31,6 +31,9 @@ def on_alert(alert):
 def on_crash(price):
     print(f"Crash at {price} — checking stop-loss...")
 
+def on_pump(price):
+    print(f"Pump at {price} — checking opportunity...")
+
 sentinel = Sentinel(
     ws_url           = "wss://stream.binance.com:9443/ws/btcusdt@trade",
     price_parser     = parsers.binance,
@@ -40,6 +43,7 @@ sentinel = Sentinel(
     cooldown_seconds = 600,   # min delay between alerts (10 min)
     on_alert         = on_alert,
     on_crash         = on_crash,   # optional — CRASH only
+    on_pump          = on_pump,    # optional — PUMP only
 )
 
 thread = sentinel.start()
@@ -78,6 +82,41 @@ sentinel = Sentinel(
 
 ---
 
+## Exchanges requiring a subscription message (Kraken, Coinbase)
+
+Some exchanges expect a JSON subscription message after the WebSocket connection is established.
+Use the `subscribe_message` parameter:
+
+```python
+import json
+
+sentinel = Sentinel(
+    ws_url            = "wss://ws.kraken.com/v2",
+    price_parser      = parsers.kraken,
+    subscribe_message = json.dumps({
+        "method": "subscribe",
+        "params": {"channel": "ticker", "symbol": ["BTC/USD"]},
+    }),
+    on_alert = on_alert,
+)
+```
+
+```python
+# Coinbase Advanced Trade
+sentinel = Sentinel(
+    ws_url            = "wss://advanced-trade-ws.coinbase.com",
+    price_parser      = parsers.coinbase,
+    subscribe_message = json.dumps({
+        "type": "subscribe",
+        "product_ids": ["BTC-USD"],
+        "channel": "ticker",
+    }),
+    on_alert = on_alert,
+)
+```
+
+---
+
 ## Alert format
 
 ```python
@@ -95,15 +134,16 @@ sentinel = Sentinel(
 
 ## Backtesting / offline use
 
-Feed prices directly without a WebSocket connection using `feed()`:
+Feed prices directly without a WebSocket connection using `feed()`.
+Leave `ws_url` empty — `start()` is never called.
 
 ```python
 sentinel = Sentinel(
-    ws_url       = "",            # unused in offline mode
-    price_parser = parsers.binance,
+    ws_url          = "",         # unused in offline mode
+    price_parser    = parsers.binance,
     crash_threshold = 3.0,
     cooldown_seconds = 0,
-    on_alert     = on_alert,
+    on_alert        = on_alert,
 )
 
 for price in historical_prices:
@@ -120,21 +160,23 @@ for price in historical_prices:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `ws_url` | str | required | WebSocket URL |
+| `ws_url` | str | required | WebSocket URL. Empty string allowed for offline/feed-only use. |
 | `price_parser` | callable | required | `(str) -> float \| None` |
 | `crash_threshold` | float | `3.0` | % drop to trigger CRASH |
 | `pump_threshold` | float | `3.0` | % rise to trigger PUMP |
 | `window_seconds` | int | `300` | Rolling window in seconds |
 | `cooldown_seconds` | int | `600` | Min seconds between alerts |
-| `max_reconnects` | int | `50` | Max reconnection attempts |
-| `on_alert` | callable | `None` | Called on CRASH or PUMP |
-| `on_crash` | callable | `None` | Called on CRASH only |
+| `max_reconnects` | int | `50` | Max reconnection attempts (must be > 0) |
+| `subscribe_message` | str \| None | `None` | JSON string sent after connection (Kraken, Coinbase) |
+| `on_alert` | callable | `None` | Called on CRASH or PUMP with alert dict |
+| `on_crash` | callable | `None` | Called on CRASH with current price |
+| `on_pump` | callable | `None` | Called on PUMP with current price |
 
 ### Methods
 
 | Method | Description |
 |--------|-------------|
-| `start()` | Start in a background daemon thread. Returns the thread. |
+| `start()` | Start in a background daemon thread. Returns the thread. Raises `SentinelError` if `ws_url` is empty. |
 | `stop()` | Signal the sentinel to stop. |
 | `feed(price)` | Inject a price directly. Returns alert dict or None. |
 | `status()` | Returns current state dict. |
@@ -145,7 +187,7 @@ for price in historical_prices:
 
 ```bash
 pip install -e ".[dev]"
-pytest                   # 50 tests
+pytest                   # 57 tests
 pytest --cov=priceflare  # with coverage
 ```
 

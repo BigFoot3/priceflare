@@ -11,19 +11,31 @@ Usage:
         print(f"{alert['type']} {alert['change_pct']:+.2f}%")
 
     sentinel = Sentinel(
-        ws_url         = "wss://stream.binance.com:9443/ws/btcusdt@trade",
-        price_parser   = parsers.binance,
-        crash_threshold = 3.0,
-        pump_threshold  = 3.0,
-        window_seconds  = 300,
+        ws_url           = "wss://stream.binance.com:9443/ws/btcusdt@trade",
+        price_parser     = parsers.binance,
+        crash_threshold  = 3.0,
+        pump_threshold   = 3.0,
+        window_seconds   = 300,
         cooldown_seconds = 600,
-        on_alert       = on_alert,
-        on_crash       = lambda price: print(f"stop-loss check at {price}"),
+        on_alert         = on_alert,
+        on_crash         = lambda price: print(f"stop-loss check at {price}"),
+        on_pump          = lambda price: print(f"pump detected at {price}"),
     )
 
     thread = sentinel.start()
     status = sentinel.status()
     sentinel.stop()
+
+Offline / backtesting usage (no WebSocket):
+    sentinel = Sentinel(
+        ws_url       = "",            # unused — feed() only
+        price_parser = parsers.binance,
+        crash_threshold  = 3.0,
+        cooldown_seconds = 0,
+        on_alert     = on_alert,
+    )
+    for price in historical_prices:
+        alert = sentinel.feed(price)
 """
 
 import threading
@@ -44,18 +56,30 @@ class Sentinel:
     oldest price within a rolling time window. Thread-safe.
 
     Args:
-        ws_url:           WebSocket URL to connect to.
-        price_parser:     Callable(raw: str) -> float | None.
-                          Parses raw WebSocket messages into a price.
-                          Return None to skip non-price messages silently.
-        crash_threshold:  % drop to trigger a CRASH alert (default: 3.0).
-        pump_threshold:   % rise to trigger a PUMP alert (default: 3.0).
-        window_seconds:   Rolling window for price comparison (default: 300).
-        cooldown_seconds: Minimum delay between two alerts (default: 600).
-        max_reconnects:   Max WebSocket reconnection attempts (default: 50).
-        on_alert:         Callback(alert: dict) called on CRASH or PUMP.
-        on_crash:         Callback(price: float) called only on CRASH.
-                          Intended for immediate stop-loss checks.
+        ws_url:            WebSocket URL to connect to.
+                           May be empty when using feed() for offline/backtesting.
+        price_parser:      Callable(raw: str) -> float | None.
+                           Parses raw WebSocket messages into a price.
+                           Return None to skip non-price messages silently.
+        crash_threshold:   % drop to trigger a CRASH alert (default: 3.0).
+        pump_threshold:    % rise to trigger a PUMP alert (default: 3.0).
+        window_seconds:    Rolling window for price comparison (default: 300).
+        cooldown_seconds:  Minimum delay between two alerts (default: 600).
+        max_reconnects:    Max WebSocket reconnection attempts (default: 50).
+        subscribe_message: JSON string sent to the server after connection.
+                           Required for exchanges like Kraken or Coinbase that
+                           need an explicit subscription message.
+        on_alert:          Callback(alert: dict) called on CRASH or PUMP.
+        on_crash:          Callback(price: float) called only on CRASH.
+                           Intended for immediate stop-loss checks.
+        on_pump:           Callback(price: float) called only on PUMP.
+                           Intended for immediate opportunity checks.
+
+    Note on reconnect_count:
+        The counter resets to 0 on every successful connection (_on_open).
+        This means a connection that repeatedly opens and immediately closes
+        will never reach max_reconnects. This is intentional — max_reconnects
+        guards against infrastructure failures, not flappy connections.
 
     Alert dict:
         {
@@ -77,11 +101,11 @@ class Sentinel:
         window_seconds: int = 300,
         cooldown_seconds: int = 600,
         max_reconnects: int = 50,
+        subscribe_message: str | None = None,
         on_alert: Callable[[dict], None] | None = None,
         on_crash: Callable[[float], None] | None = None,
+        on_pump: Callable[[float], None] | None = None,
     ) -> None:
-        if not ws_url:
-            raise SentinelError("ws_url cannot be empty")
         if not callable(price_parser):
             raise SentinelError("price_parser must be callable")
         if crash_threshold <= 0 or pump_threshold <= 0:
@@ -90,16 +114,20 @@ class Sentinel:
             raise SentinelError("window_seconds must be > 0")
         if cooldown_seconds < 0:
             raise SentinelError("cooldown_seconds must be >= 0")
+        if max_reconnects <= 0:
+            raise SentinelError("max_reconnects must be > 0")
 
-        self._ws_url          = ws_url
-        self._parser          = price_parser
-        self._crash_threshold = crash_threshold
-        self._pump_threshold  = pump_threshold
-        self._window_sec      = window_seconds
-        self._cooldown_sec    = cooldown_seconds
-        self._max_reconnects  = max_reconnects
-        self._on_alert        = on_alert
-        self._on_crash        = on_crash
+        self._ws_url            = ws_url
+        self._parser            = price_parser
+        self._crash_threshold   = crash_threshold
+        self._pump_threshold    = pump_threshold
+        self._window_sec        = window_seconds
+        self._cooldown_sec      = cooldown_seconds
+        self._max_reconnects    = max_reconnects
+        self._subscribe_message = subscribe_message
+        self._on_alert          = on_alert
+        self._on_crash          = on_crash
+        self._on_pump           = on_pump
 
         # Internal state — protected by _lock
         self._lock            = threading.Lock()
@@ -118,9 +146,16 @@ class Sentinel:
         """
         Start the sentinel in a background daemon thread.
 
+        Raises:
+            SentinelError: if ws_url is empty (use feed() for offline mode).
+
         Returns:
             The running thread (for optional monitoring).
         """
+        if not self._ws_url:
+            raise SentinelError(
+                "ws_url cannot be empty — use feed() for offline/backtesting"
+            )
         self._stop_event.clear()
         t = threading.Thread(
             target=self._run,
@@ -166,7 +201,7 @@ class Sentinel:
 
         Useful for testing or feeding prices from sources other than
         a WebSocket (e.g. REST polling, backtesting).
-        Triggers on_alert / on_crash callbacks if an alert fires.
+        Triggers on_alert / on_crash / on_pump callbacks if an alert fires.
 
         Returns:
             Alert dict if a movement is detected, None otherwise.
@@ -243,18 +278,25 @@ class Sentinel:
         if self._on_alert:
             try:
                 self._on_alert(alert)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠️  PriceFlare on_alert callback error: {e}", flush=True)
+
         if alert["type"] == "CRASH" and self._on_crash:
             try:
                 self._on_crash(alert["cur_price"])
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠️  PriceFlare on_crash callback error: {e}", flush=True)
+
+        if alert["type"] == "PUMP" and self._on_pump:
+            try:
+                self._on_pump(alert["cur_price"])
+            except Exception as e:
+                print(f"⚠️  PriceFlare on_pump callback error: {e}", flush=True)
 
     def _on_message(self, ws, raw: str) -> None:
         try:
             price = self._parser(raw)
-        except (ParserError, Exception):
+        except Exception:
             return
         if price is None:
             return
@@ -267,6 +309,8 @@ class Sentinel:
             self._running         = True
             self._reconnect_count = 0
         print("✅ PriceFlare connected", flush=True)
+        if self._subscribe_message:
+            ws.send(self._subscribe_message)
 
     def _on_close(self, ws, code, msg) -> None:
         with self._lock:
