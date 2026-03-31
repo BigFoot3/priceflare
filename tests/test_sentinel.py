@@ -6,7 +6,7 @@ import json
 import time
 import threading
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 from priceflare import Sentinel, parsers
 from priceflare.exceptions import ParserError, SentinelError
 
@@ -30,12 +30,15 @@ def make_sentinel(**kwargs) -> Sentinel:
 
 def _feed_prices(sentinel: Sentinel, prices: list[float],
                  base_ts: float | None = None) -> list[dict | None]:
-    """Feed a list of prices into sentinel._check_movement with controlled timestamps."""
+    """Feed a list of prices into _check_movement with controlled timestamps.
+
+    Uses the ts parameter directly — no time.time() patching required.
+    Each price is stamped base_ts + index (one second apart).
+    """
     results = []
     now = base_ts or time.time()
     for i, price in enumerate(prices):
-        with patch("time.time", return_value=now + i):
-            results.append(sentinel._check_movement(price))
+        results.append(sentinel._check_movement(price, ts=now + i))
     return results
 
 
@@ -182,51 +185,35 @@ class TestPumpDetection:
 class TestCooldown:
     def test_cooldown_prevents_second_alert(self):
         s = make_sentinel(crash_threshold=3.0, cooldown_seconds=600)
-        now = time.time()
-
-        # First crash
-        with patch("time.time", return_value=now):
-            prices = [1000.0] * 10 + [960.0]
-            for p in prices:
-                s._check_movement(p)
-
-        # Second crash — within cooldown
-        with patch("time.time", return_value=now + 60):
-            result = s._check_movement(900.0)
+        now = 1_000_000.0
+        for p in [1000.0] * 10 + [960.0]:
+            s._check_movement(p, ts=now)
+        result = s._check_movement(900.0, ts=now + 60)
         assert result is None
 
     def test_alert_fires_after_cooldown_expires(self):
         s = make_sentinel(crash_threshold=3.0, cooldown_seconds=600)
-        now = time.time()
-
-        # First crash
-        with patch("time.time", return_value=now):
-            for p in [1000.0] * 10 + [960.0]:
-                s._check_movement(p)
-
-        # After cooldown — prices need to be within new window
+        now = 1_000_000.0
+        for p in [1000.0] * 10 + [960.0]:
+            s._check_movement(p, ts=now)
         after = now + 700
-        with patch("time.time", return_value=after):
-            for p in [1000.0] * 10:
-                s._check_movement(p)
-            result = s._check_movement(960.0)
-
+        for p in [1000.0] * 10:
+            s._check_movement(p, ts=after)
+        result = s._check_movement(960.0, ts=after)
         assert result is not None
         assert result["type"] == "CRASH"
 
     def test_zero_cooldown_allows_immediate_second_alert(self):
         s = make_sentinel(crash_threshold=3.0, cooldown_seconds=0)
-        now = time.time()
+        now = 1_000_000.0
         alerts = []
-        with patch("time.time", return_value=now):
-            for p in [1000.0] * 10 + [960.0]:
-                r = s._check_movement(p)
-                if r:
-                    alerts.append(r)
-        with patch("time.time", return_value=now + 1):
-            r = s._check_movement(920.0)
+        for p in [1000.0] * 10 + [960.0]:
+            r = s._check_movement(p, ts=now)
             if r:
                 alerts.append(r)
+        r = s._check_movement(920.0, ts=now + 1)
+        if r:
+            alerts.append(r)
         assert len(alerts) >= 1
 
 
@@ -237,28 +224,19 @@ class TestCooldown:
 class TestWindowEviction:
     def test_old_prices_evicted(self):
         s = make_sentinel(window_seconds=300, cooldown_seconds=0)
-        now = time.time()
-
-        # Feed prices at t=0
-        with patch("time.time", return_value=now):
-            for p in [1000.0] * 10:
-                s._check_movement(p)
-
-        # Feed at t=400 (outside 300s window)
-        with patch("time.time", return_value=now + 400):
-            result = s._check_movement(500.0)  # would be −50% if ref was 1000
-
-        # Old prices evicted → fewer than 10 prices in window → no alert
+        now = 1_000_000.0
+        for p in [1000.0] * 10:
+            s._check_movement(p, ts=now)
+        # t+400 — outside 300s window, old prices evicted → < 10 in window
+        result = s._check_movement(500.0, ts=now + 400)
         assert result is None
 
     def test_prices_within_window_kept(self):
         s = make_sentinel(window_seconds=300, cooldown_seconds=0)
-        now = time.time()
-        with patch("time.time", return_value=now):
-            for p in [1000.0] * 10:
-                s._check_movement(p)
-        with patch("time.time", return_value=now + 299):
-            result = s._check_movement(960.0)  # −4%, within window
+        now = 1_000_000.0
+        for p in [1000.0] * 10:
+            s._check_movement(p, ts=now)
+        result = s._check_movement(960.0, ts=now + 299)  # −4%, within window
         assert result is not None
 
 
@@ -374,6 +352,50 @@ class TestFeed:
         result = s.feed(960.0)
         assert result is not None
         assert result["type"] == "CRASH"
+
+
+# ---------------------------------------------------------------------------
+# feed() — timestamp parameter (backtesting)
+# ---------------------------------------------------------------------------
+
+class TestFeedWithTimestamp:
+    def test_custom_timestamp_triggers_correct_alert(self):
+        """Historical timestamps drive window logic, not wall clock."""
+        s = make_sentinel(crash_threshold=3.0, cooldown_seconds=0, window_seconds=300)
+        base_ts = 1_000_000.0
+        for i in range(10):
+            s.feed(1000.0, timestamp=base_ts + i)
+        result = s.feed(960.0, timestamp=base_ts + 10)
+        assert result is not None
+        assert result["type"] == "CRASH"
+
+    def test_historical_window_evicts_old_prices(self):
+        """Prices outside the historical window are evicted even in offline mode."""
+        s = make_sentinel(crash_threshold=3.0, cooldown_seconds=0, window_seconds=300)
+        base_ts = 1_000_000.0
+        for _ in range(10):
+            s.feed(1000.0, timestamp=base_ts)
+        # t+400 → outside 300s window → eviction → < 10 prices → no alert
+        result = s.feed(500.0, timestamp=base_ts + 400)
+        assert result is None
+
+    def test_historical_cooldown_respected(self):
+        """Cooldown uses custom timestamps, not real time."""
+        s = make_sentinel(crash_threshold=3.0, cooldown_seconds=600, window_seconds=300)
+        base_ts = 1_000_000.0
+        for p in [1000.0] * 10 + [960.0]:
+            s.feed(p, timestamp=base_ts)
+        # 60s after first alert — still within cooldown
+        result = s.feed(900.0, timestamp=base_ts + 60)
+        assert result is None
+
+    def test_feed_without_timestamp_still_works(self):
+        """feed() without timestamp uses real time — real-time mode unaffected."""
+        s = make_sentinel(crash_threshold=3.0, cooldown_seconds=0)
+        for _ in range(10):
+            s.feed(1000.0)
+        result = s.feed(960.0)
+        assert result is not None
 
 
 # ---------------------------------------------------------------------------

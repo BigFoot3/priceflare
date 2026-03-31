@@ -146,8 +146,8 @@ sentinel = Sentinel(
     on_alert        = on_alert,
 )
 
-for price in historical_prices:
-    alert = sentinel.feed(price)
+for price, ts in zip(historical_prices, historical_timestamps):
+    alert = sentinel.feed(price, timestamp=ts)   # timestamp = Unix float
     if alert:
         print(alert)
 ```
@@ -178,7 +178,7 @@ for price in historical_prices:
 |--------|-------------|
 | `start()` | Start in a background daemon thread. Returns the thread. Raises `SentinelError` if `ws_url` is empty. |
 | `stop()` | Signal the sentinel to stop. |
-| `feed(price)` | Inject a price directly. Returns alert dict or None. |
+| `feed(price, timestamp=None)` | Inject a price directly. `timestamp`: Unix float for historical data. Returns alert dict or None. |
 | `status()` | Returns current state dict. |
 
 ---
@@ -187,7 +187,7 @@ for price in historical_prices:
 
 ```bash
 pip install -e ".[dev]"
-pytest                   # 57 tests
+pytest                   # 61 tests
 pytest --cov=priceflare  # with coverage
 ```
 

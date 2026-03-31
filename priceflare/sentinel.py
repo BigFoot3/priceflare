@@ -195,7 +195,7 @@ class Sentinel:
     # Movement detection
     # ------------------------------------------------------------------
 
-    def feed(self, price: float) -> dict | None:
+    def feed(self, price: float, timestamp: float | None = None) -> dict | None:
         """
         Feed a price directly into the detector.
 
@@ -203,16 +203,23 @@ class Sentinel:
         a WebSocket (e.g. REST polling, backtesting).
         Triggers on_alert / on_crash / on_pump callbacks if an alert fires.
 
+        Args:
+            price:     The price to inject.
+            timestamp: Unix timestamp for this price (seconds). Defaults to
+                       the current real time. Pass historical timestamps when
+                       replaying past data so the rolling window behaves
+                       correctly relative to the data, not the wall clock.
+
         Returns:
             Alert dict if a movement is detected, None otherwise.
         """
-        alert = self._check_movement(price)
+        alert = self._check_movement(price, ts=timestamp)
         if alert:
             self._dispatch(alert)
         return alert
 
-    def _check_movement(self, current_price: float) -> dict | None:
-        now = time.time()
+    def _check_movement(self, current_price: float, ts: float | None = None) -> dict | None:
+        now = ts if ts is not None else time.time()
 
         with self._lock:
             self._prices.append((now, current_price))
