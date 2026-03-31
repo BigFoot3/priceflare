@@ -347,7 +347,7 @@ class Sentinel:
                     on_error   = self._on_error,
                     on_close   = self._on_close,
                 )
-                ws.run_forever(ping_interval=30, ping_timeout=10)
+                ws.run_forever(ping_interval=0)
 
             except Exception as e:
                 print(f"❌ PriceFlare exception: {e}", flush=True)
